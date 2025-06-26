@@ -1,11 +1,16 @@
-import requests
+import hashlib
+import dotenv
+import base64
+import json
 import csv
-from hashlib import md5
-from os import path
-from io import BytesIO
-from PIL import Image
-from bs4 import BeautifulSoup
+import re
+
 from time import sleep
+
+import requests
+
+from bs4 import BeautifulSoup
+from os import path,environ
 
 
 class Lessons:
@@ -17,6 +22,33 @@ class Lessons:
         self.session = requests.session()
         self.lessons_list = []
         self.dealType = dealType
+        dotenv.load_dotenv()
+        for key in ["uname", "password","recap_username", "recap_password"]:
+            if not environ.get(key):
+                print(f"请在环境变量中设置{key}")
+                exit(-1)
+        self.base = environ.get("base", "http://jwstudent.lnu.edu.cn")
+
+    @staticmethod
+    def recapture(b64):
+        data = {
+            "username": environ.get("recap_username"), 
+            "password": environ.get("recap_password"), 
+            "ID": "04897896", 
+            "b64": b64, 
+            "version": "3.1.1"
+        }
+        data_json = json.dumps(data)
+        result = json.loads(requests.post("http://www.fdyscloud.com.cn/tuling/predict", data=data_json).text)
+        return result["data"]["result"]
+
+
+    @staticmethod
+    def pwd_md5(string: str) -> str:
+        md5_part1 = hashlib.md5((string + "{Urp602019}").encode()).hexdigest().lower()
+        md5_part2 = hashlib.md5(string.encode()).hexdigest().lower()
+        final_result = md5_part1 + '*' + md5_part2
+        return final_result
 
     def deal_info(self, lessons_info):  # 将课程信息进行转换
         deal_lessons = []
@@ -54,52 +86,53 @@ class Lessons:
         return data
 
     def login(self):  # 登录模块
-        self.id = str(input("用户名为："))
-        passwd = md5(bytes(str(input("密码为："))))
-        try:
-            login_img = self.session.get("https://urp.shou.edu.cn/img/captcha.jpg", timeout=10)
-        except requests.ConnectionError:
-            print("获取验证码失败！连接错误！")
-            exit(0)
-        except requests.HTTPError:
-            print("获取验证码失败！请求网页有问题！")
-            exit(0)
-        except requests.Timeout:
-            print("获取验证码失败！请求超时！")
-            exit(0)
+        username = environ.get("uname")
+        password = environ.get("password")
+        self.username = username
+        
+        req = self.session.get("http://jwstudent.lnu.edu.cn/login")
+        req.raise_for_status()
+        html = req.text
+        match = re.search(r'name="tokenValue" value="(.+?)">', html)
+        if match:
+            token_value = match.group(1)
         else:
-            if login_img.text == '':
-                print("获取验证码失败！验证码为空！")
-                exit(0)
-            byteio = BytesIO()
-            byteio.write(login_img.content)
-            img = Image.open(byteio)
-            img.show()  # 可能会出现没有验证码情况，未解决！！！
-            code = str(input("验证码为："))
-            data = {"j_username": self.id, "j_password": passwd, "j_captcha": code,
-                    "_spring_security_remember_me": "on"}
-            try:
-                rp = self.session.post(url="https://urp.shou.edu.cn/j_spring_security_check",
-                                       data=data,
-                                       timeout=10)
-            except requests.ConnectionError:
-                print("登录失败！连接错误！")
-                exit(0)
-            except requests.HTTPError:
-                print("登录失败！请求网页有问题！")
-                exit(0)
-            except requests.Timeout:
-                print("登录失败！请求超时！")
-                exit(0)
-            else:
-                if rp.url == "https://urp.shou.edu.cn/login?errorCode=badCaptcha":
-                    print("验证码输入错误！")
-                    exit(0)
-                elif rp.url == "https://urp.shou.edu.cn/login?errorCode=badCredentials":
-                    print("用户名或密码输入错误！")
-                    exit(0)
-        return
+            raise ValueError("未找到 tokenValue")
 
+        req = self.session.get(f"{self.base}/img/captcha.jpg")
+        req.raise_for_status()
+        im = req.content
+        b64 = base64.b64encode(im).decode('utf-8')
+        captcha_code = self.recapture(b64=b64)
+        with open("captcha.jpg", "wb") as f:
+            f.write(im)
+        print(captcha_code)
+
+        hashed_password = self.pwd_md5(password)
+
+        # 模拟请求的 payload
+        payload = {
+            "j_username": username,
+            "j_password": hashed_password,
+            "j_captcha": captcha_code,
+            "tokenValue": token_value
+        }
+
+        # 发送 POST 请求
+        url = f"{self.base}/j_spring_security_check"  # 替换为实际登录地址
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        response = self.session.post(url, data=payload, headers=headers)
+
+        if "发生错误" in response.text:
+            err = re.search(r'<strong>发生错误！</strong>(.+)', response.text)
+            if err:
+                error_message = err.group(1).strip()
+                raise ValueError(f"登录失败: {error_message}")
+            raise ValueError("登录失败")
+        
     def judge_info(self, lesson_no, info):  # 对选课结果进行判断
         if info != "你选择的课程没有课余量！":
             for i in range(len(self.lessons_list)):
@@ -107,13 +140,11 @@ class Lessons:
                     self.lessons_list.pop(i)
                     print(lesson_no + ":" + info)
                     break
-        return
 
     def judge_logout(self, html):  # 账号在其他地方被登录时报错
-        if html.url == "https://urp.shou.edu.cn/login?errorCode=concurrentSessionExpired":
+        if html.url == f"{self.base}/login?errorCode=concurrentSessionExpired":
             print("有人登陆了您的账号！")
             exit(0)
-        return
 
     def judge_choose(self, bs):
         alart = bs.find("div", {"class": "alert alert-block alert-danger"})  # 判断是否可以选课
@@ -137,7 +168,7 @@ class Lessons:
 
     def get_lesson_page(self):
         try:
-            html = self.session.get(url="https://urp.shou.edu.cn/student/courseSelect/courseSelect/index",
+            html = self.session.get(url=f"{self.base}/student/courseSelect/courseSelect/index",
                                     timeout=10)
         except requests.ConnectionError:
             print("选课页面无法加载！连接错误！")
@@ -154,7 +185,7 @@ class Lessons:
             return bs
 
     def get_lessons_list(self):
-        road = "user_info/" + str(self.id) + ".csv"
+        road = "user_info/" + str(self.username) + ".csv"
         if not path.exists(road):  # 导入选课内容
             print("选课文件不存在！请检查！")
             exit(0)
@@ -169,7 +200,7 @@ class Lessons:
         lessons_list = []
         for lesson in self.lessons_list:
             data = {'searchtj': lesson['no'], 'xq': '0', 'jc': '0', 'kclbdm': ''}
-            url = 'https://urp.shou.edu.cn/student/courseSelect/freeCourse/courseList'
+            url = f"{self.base}/student/courseSelect/freeCourse/courseList"
             for count in range(1, 11):
                 try:
                     rp = self.session.post(url=url, data=data, timeout=10)
@@ -209,7 +240,7 @@ class Lessons:
         data = self.sum_lessons(tokenValue, deal_lessons)
         for flag in range(1, 11):
             try:  # 提交选课表单
-                rq = self.session.post(url="https://urp.shou.edu.cn/student/courseSelect"
+                rq = self.session.post(url=f"{self.base}/student/courseSelect"
                                            "/selectCourse/checkInputCodeAndSubmit",
                                        data=data,
                                        timeout=10)
@@ -235,7 +266,7 @@ class Lessons:
         data.pop("inputCode")
         for flag in range(1, 11):
             try:  # 网站要求的选课二次确认
-                self.session.post(url="https://urp.shou.edu.cn/student/courseSelect/selectCourses/waitingfor",
+                self.session.post(url=f"{self.base}/student/courseSelect/selectCourses/waitingfor",
                                   data=data,
                                   timeout=10)
             except requests.ConnectionError:
@@ -256,12 +287,12 @@ class Lessons:
             print("选课提交确认失败！请检查urp！")
             exit(0)
         self.judge_logout(rq)
-        data = {"kcNum": str(len(lesson_list)), "redisKey": self.id + self.dealType}
+        data = {"kcNum": str(len(lesson_list)), "redisKey": self.username + self.dealType}
         i = 1
         while True:
             sleep(1)  # 让服务器处理选课的等待时间，严禁删除！！！
             try:  # 获取选课结果
-                rq = self.session.post(url="https://urp.shou.edu.cn/student/"
+                rq = self.session.post(url=f"{self.base}/student/"
                                            "  courseSelect/selectResult/query",
                                        data=data,
                                        timeout=10)
